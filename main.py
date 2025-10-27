@@ -21,7 +21,7 @@ if local == True:
     API_TOKEN = os.getenv("TG_TOKEN_LOCAL")
     DB_HOST = 'localhost'
     DB_PORT = 3307
-    DB_NAME = 's3_manager_local'
+    DB_NAME = 's3_manager'
     DB_USER = 's3_user'
     DB_PASSWORD = 'Kfleirb_17$_'
 else:
@@ -88,6 +88,39 @@ def additional_decision_keyboard() -> InlineKeyboardMarkup:
     return keyboard
 
 
+def region_keyboard() -> InlineKeyboardMarkup:
+    keyboard = InlineKeyboardMarkup()
+    for region in REGION_OPTIONS:
+        keyboard.add(InlineKeyboardButton(region, callback_data=f"region_{region}"))
+    keyboard.add(InlineKeyboardButton("⬅️ Назад", callback_data="back"))
+    return keyboard
+
+
+def departments_keyboard(departments: List[Dict[str, object]], selected_departments: List[str] = None) -> InlineKeyboardMarkup:
+    if selected_departments is None:
+        selected_departments = []
+    
+    keyboard = InlineKeyboardMarkup()
+    
+    # Добавляем кнопки для каждого отдела
+    for dept in departments:
+        is_selected = dept['name'] in selected_departments
+        emoji = "✅" if is_selected else "📁"
+        keyboard.add(InlineKeyboardButton(
+            f"{emoji} {dept['name']}", 
+            callback_data=f"dept_{dept['id']}"
+        ))
+    
+    # Кнопки управления
+    keyboard.row(
+        InlineKeyboardButton("✅ Подтвердить выбор", callback_data="confirm_departments"),
+        InlineKeyboardButton("🔄 Сбросить", callback_data="reset_departments")
+    )
+    keyboard.add(InlineKeyboardButton("⬅️ Назад", callback_data="back"))
+    
+    return keyboard
+
+
 def _fetch_departments_sync() -> List[Dict[str, object]]:
     with get_db_connection() as conn:
         with conn.cursor() as cursor:
@@ -109,21 +142,12 @@ async def fetch_departments() -> List[Dict[str, object]]:
 
 async def send_departments_prompt(target, state: FSMContext) -> None:
     departments = await fetch_departments()
-    await state.update_data(departments_catalog=departments)
+    await state.update_data(departments_catalog=departments, selected_departments=[])
 
     if not departments:
-        text = (
-            "Отделы не найдены в системе. Свяжитесь с администратором для уточнения."
-        )
+        await target.answer("Отделы не найдены в системе. Свяжитесь с администратором для уточнения.", reply_markup=back_keyboard())
     else:
-        lines = [f"{idx}. {dept['name']}" for idx, dept in enumerate(departments, start=1)]
-        numbered_list = "\n".join(lines)
-        text = (
-            "Выберите отделы, указав номера через запятую (например 1,3,2).\n"
-            f"\n{numbered_list}"
-        )
-
-    await target.answer(text, reply_markup=back_keyboard())
+        await target.answer("Выберите отделы:\n\nВыбрано: ничего", reply_markup=departments_keyboard(departments, []))
 
 
 def send_region_prompt_text() -> str:
@@ -136,7 +160,7 @@ def send_region_prompt_text() -> str:
 
 
 async def send_region_prompt(target, state: FSMContext) -> None:
-    await target.answer(send_region_prompt_text(), reply_markup=back_keyboard())
+    await target.answer("Выберите регион:", reply_markup=region_keyboard())
 
 
 def _get_user_by_telegram_sync(telegram_id: str) -> Optional[Dict[str, object]]:
@@ -543,66 +567,93 @@ async def process_middle_name(message: Message, state: FSMContext) -> None:
     await send_region_prompt(message, state)
 
 
-async def process_region(message: Message, state: FSMContext) -> None:
-    text = message.text.strip()
-    region = None
-    if text.isdigit():
-        index = int(text)
-        if 1 <= index <= len(REGION_OPTIONS):
-            region = REGION_OPTIONS[index - 1]
-    else:
-        for option in REGION_OPTIONS:
-            if option.lower() == text.lower():
-                region = option
-                break
-    if not region:
-        await message.answer("Введите номер или название региона из списка.", reply_markup=back_keyboard())
-        return
-    await state.update_data(region=region, departments=[])
+# Обработчики для инлайн кнопок регионов и отделов
+async def handle_region_selection(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
+    try:
+        await query.message.edit_reply_markup()
+    except Exception:
+        pass
+
+    region = query.data.replace("region_", "")
+    await state.update_data(region=region)
     await state.set_state(InviteRequestForm.waiting_departments.state)
-    await send_departments_prompt(message, state)
+    await send_departments_prompt(query.message, state)
 
 
-async def process_departments(message: Message, state: FSMContext) -> None:
-    text = message.text.strip()
-    normalized = text.replace(" ", "")
-    if not normalized:
-        await message.answer(
-            "Укажите хотя бы один номер отдела.",
-            reply_markup=back_keyboard(),
+async def handle_department_selection(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
+    try:
+        await query.message.edit_reply_markup()
+    except Exception:
+        pass
+
+    dept_id = int(query.data.replace("dept_", ""))
+    data = await state.get_data()
+    catalog: List[Dict[str, object]] = data.get("departments_catalog", [])
+    selected_departments: List[str] = data.get("selected_departments", [])
+    
+    # Находим отдел по ID
+    dept_name = None
+    for dept in catalog:
+        if dept['id'] == dept_id:
+            dept_name = dept['name']
+            break
+    
+    if dept_name:
+        if dept_name in selected_departments:
+            # Убираем отдел из выбранных
+            selected_departments.remove(dept_name)
+        else:
+            # Добавляем отдел к выбранным
+            selected_departments.append(dept_name)
+        
+        await state.update_data(selected_departments=selected_departments)
+        
+        # Обновляем клавиатуру с новым состоянием
+        updated_keyboard = departments_keyboard(catalog, selected_departments)
+        await query.message.edit_text(
+            f"Выберите отделы:\n\nВыбрано: {', '.join(selected_departments) if selected_departments else 'ничего'}",
+            reply_markup=updated_keyboard
         )
-        return
 
-    if not re.fullmatch(r"\d+(,\d+)*", normalized):
-        await message.answer(
-            "Введите номера отделов через запятую, например 1,3,2.",
-            reply_markup=back_keyboard(),
-        )
-        return
+
+async def handle_departments_confirm(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
+    try:
+        await query.message.edit_reply_markup()
+    except Exception:
+        pass
 
     data = await state.get_data()
-    catalog: List[Dict[str, object]] = data.get("departments_catalog") or []
-    if not catalog:
-        await send_departments_prompt(message, state)
+    selected_departments: List[str] = data.get("selected_departments", [])
+    
+    if not selected_departments:
+        await query.message.answer("Выберите хотя бы один отдел.", reply_markup=departments_keyboard(data.get("departments_catalog", []), []))
         return
-
-    indexes = [int(part) for part in normalized.split(",")]
-    unique_indexes = list(dict.fromkeys(indexes))
-
-    if any(idx < 1 or idx > len(catalog) for idx in unique_indexes):
-        await message.answer(
-            "Указан номер вне диапазона списка. Попробуйте снова.",
-            reply_markup=back_keyboard(),
-        )
-        return
-
-    selected = [catalog[idx - 1]["name"] for idx in unique_indexes]
-    await state.update_data(departments=selected)
+    
+    await state.update_data(departments=selected_departments)
     await state.set_state(InviteRequestForm.waiting_confirmation.state)
-    selected_text = ", ".join(selected) if selected else "—"
-    await message.answer(
+    selected_text = ", ".join(selected_departments)
+    await query.message.answer(
         f"Вы выбрали отделы: {selected_text}. Подтвердить?",
         reply_markup=confirmation_keyboard(),
+    )
+
+
+async def handle_departments_reset(query: CallbackQuery, state: FSMContext) -> None:
+    await query.answer()
+    try:
+        await query.message.edit_reply_markup()
+    except Exception:
+        pass
+
+    data = await state.get_data()
+    catalog: List[Dict[str, object]] = data.get("departments_catalog", [])
+    await state.update_data(selected_departments=[])
+    await query.message.edit_text(
+        "Выберите отделы:\n\nВыбрано: ничего",
+        reply_markup=departments_keyboard(catalog, [])
     )
 
 
@@ -630,7 +681,7 @@ async def handle_back(query: CallbackQuery, state: FSMContext) -> None:
     elif current_state == InviteRequestForm.waiting_departments.state:
         data = await state.get_data()
         if data.get("is_additional"):
-            await state.update_data(departments=[])
+            await state.update_data(departments=[], selected_departments=[])
             await state.set_state(InviteRequestForm.waiting_additional_decision.state)
             await query.message.answer(
                 "Хотите подать заявку на доступ к дополнительным отделам?",
@@ -638,7 +689,7 @@ async def handle_back(query: CallbackQuery, state: FSMContext) -> None:
             )
         else:
             await state.set_state(InviteRequestForm.waiting_region.state)
-            await state.update_data(departments=[])
+            await state.update_data(departments=[], selected_departments=[])
             await send_region_prompt(query.message, state)
     elif current_state == InviteRequestForm.waiting_confirmation.state:
         await state.set_state(InviteRequestForm.waiting_departments.state)
@@ -736,14 +787,17 @@ def main() -> None:
                                        lambda c: c.data in {"additional_yes", "additional_no"}, state="*")
     dp.register_callback_query_handler(handle_confirmation, lambda c: c.data in {"confirm_yes", "confirm_no"},
                                        state="*")
+    dp.register_callback_query_handler(handle_region_selection, lambda c: c.data.startswith("region_"), state="*")
+    dp.register_callback_query_handler(handle_department_selection, lambda c: c.data.startswith("dept_"), state="*")
+    dp.register_callback_query_handler(handle_departments_confirm, text="confirm_departments", state="*")
+    dp.register_callback_query_handler(handle_departments_reset, text="reset_departments", state="*")
     dp.register_callback_query_handler(handle_back, text="back", state="*")
 
     # Обработчики состояний (должны быть после команд)
     dp.register_message_handler(process_first_name, state=InviteRequestForm.waiting_first_name)
     dp.register_message_handler(process_last_name, state=InviteRequestForm.waiting_last_name)
     dp.register_message_handler(process_middle_name, state=InviteRequestForm.waiting_middle_name)
-    dp.register_message_handler(process_region, state=InviteRequestForm.waiting_region)
-    dp.register_message_handler(process_departments, state=InviteRequestForm.waiting_departments)
+    # process_region и process_departments удалены - теперь используются инлайн кнопки
 
     logging.info("=" * 60)
     logging.info("🚀 БОТ ЗАПУЩЕН И ГОТОВ К РАБОТЕ")
